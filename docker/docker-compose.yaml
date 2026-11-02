@@ -1,25 +1,30 @@
 name: rosterforge
 
+# Infra only (run the app from your IDE):
+#   docker compose -f docker/docker-compose.yaml up -d
+# Full stack, app included (just needs Docker on the machine):
+#   docker compose -f docker/docker-compose.yaml --profile app up -d --build
+
 services:
   postgres:
     image: docker.io/library/postgres:16
     container_name: rosterforge-postgres
     environment:
       POSTGRES_DB: rosterforge
-      POSTGRES_USER: rosterforge
-      POSTGRES_PASSWORD: rosterforge
+      POSTGRES_USER: ${POSTGRES_USER:-rosterforge}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rosterforge}
     ports:
       - "5434:5432"
     volumes:
       - rosterforge_pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U rosterforge"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d rosterforge"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
 
   vault:
-    image: docker.io/hashicorp/vault:latest
+    image: docker.io/hashicorp/vault:1.18
     container_name: rosterforge-vault
     ports:
       - "8200:8200"
@@ -28,21 +33,75 @@ services:
       VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
     cap_add:
       - IPC_LOCK
-    
+    healthcheck:
+      test: ["CMD", "vault", "status", "-address=http://127.0.0.1:8200"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Dev-mode Vault keeps everything in memory, so a fresh machine (or any restart)
+  # starts with an empty secret/rosterforge. This one-shot job seeds it.
+  vault-init:
+    image: docker.io/hashicorp/vault:1.18
+    container_name: rosterforge-vault-init
+    depends_on:
+      vault:
+        condition: service_healthy
+    environment:
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN: root
+    command: >
+      vault kv put secret/rosterforge
+      spring.datasource.username=${POSTGRES_USER:-rosterforge}
+      spring.datasource.password=${POSTGRES_PASSWORD:-rosterforge}
+    restart: "no"
+
   kafka:
-    image: apache/kafka:latest
+    image: docker.io/apache/kafka:4.0.0
     container_name: rosterforge-kafka
     ports:
       - "9094:9092"
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9094
+      # INTERNAL is for containers on the compose network, EXTERNAL for the host (localhost:9094).
+      KAFKA_LISTENERS: INTERNAL://:29092,EXTERNAL://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Single broker: internal topics can't use the default replication factor of 3.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka:29092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  app:
+    profiles: ["app"]
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: rosterforge:local
+    container_name: rosterforge-app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      vault-init:
+        condition: service_completed_successfully
+    environment:
+      # Override the localhost addresses in application.properties with compose service names.
+      SPRING_CLOUD_VAULT_URI: http://vault:8200
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/rosterforge
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    ports:
+      - "${APP_PORT:-8080}:8080"
 
 volumes:
   rosterforge_pgdata:
