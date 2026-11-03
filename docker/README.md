@@ -42,6 +42,86 @@ Run the same command again after a reboot. Vault always restarts sealed, and `up
    the container) and to `docker/.secrets/` (for IDE runs, gitignored). The app loads them
    through `configtree`, logs in to Vault, and reads its datasource credentials from there.
 
+## How Vault unseals and the app gets its secrets
+
+### What `vault-bootstrap` is
+
+A one-shot container that does the job a human Vault operator would do: initialize Vault,
+unseal it after every restart, and set up the policy and login the app needs. It uses the
+same `hashicorp/vault` image, but only for the `vault` command-line tool. It runs
+`vault/bootstrap.sh` against the real Vault server at `http://vault:8200`, then exits.
+The app waits for it to finish (`service_completed_successfully`).
+
+It's the only service that mounts the `vault-keys` volume, so it's the only one that can
+read the unseal key and root token.
+
+### Three keys, each locking the next
+
+```
+unseal key       ← in vault-keys/init.txt. Vault never stores it.
+   locks ▼
+root key         ← stored encrypted in vault-data
+   locks ▼
+encryption key   ← stored encrypted in vault-data
+   locks ▼
+your secrets     ← stored encrypted in vault-data
+```
+
+The layers let each key change without touching the others. The encryption key can be
+rotated without re-encrypting everything, and the unseal key can be replaced
+(`vault operator rekey`), split into shares, or handed to a cloud KMS without touching the
+data.
+
+### The flow
+
+Vault always starts **sealed**: it has its data but can't decrypt it. `vault-bootstrap`
+asks Vault whether it is initialized.
+
+- **First start only (init):** Vault isn't initialized, so the bootstrap runs
+  `vault operator init`. Vault generates the three keys and stores the encrypted root key
+  and encryption key in `vault-data`. It returns the unseal key and root token **once**,
+  and the bootstrap saves them right away to `init.txt` on the `vault-keys` volume. Init
+  doesn't unseal Vault; that's the next step.
+- **Every start (unseal):** the bootstrap reads the unseal key from `init.txt` and sends it
+  to Vault (`PUT /v1/sys/unseal`). Vault uses it to decrypt the root key, which decrypts
+  the encryption key. It keeps those in memory and forgets the unseal key. The bootstrap
+  then (re)applies the policy, AppRole and `secret/rosterforge`, and exits.
+
+**Only then does the app start:**
+
+```
+1. app ── POST /v1/auth/approle/login {role_id, secret_id} ──► vault
+   app ◄── token (policy rosterforge-app, 1h, renewable up to 24h) ──
+
+2. app ── GET /v1/secret/data/rosterforge   X-Vault-Token: <token> ──► vault
+         vault checks the token's policy allows this path,
+         decrypts the secret with the encryption key in memory
+   app ◄── spring.datasource.username / spring.datasource.password ──
+
+3. app ── username + password ──► postgres (role rosterforge)
+```
+
+The token is permission, not a key. Vault does the decrypting, and only if the policy
+allows the path; any other path, or no token, gets `403 Forbidden`. The app never sees any
+key, and the unseal key plays no part after unsealing.
+
+When Vault restarts, its memory is wiped and it's sealed again. The next `compose up`
+repeats the unseal step.
+
+### Where the unseal key lives
+
+```
+Windows
+ └─ Podman VM (podman-machine-default)
+     └─ /var/lib/containers/storage/volumes/rosterforge_vault-keys/_data/init.txt
+```
+
+It's not on the Windows drive or in the repo. Only `vault-bootstrap` mounts it, at
+`/vault-keys`. It survives restarts, reboots and `down` without `-v`. It's deleted by
+`down -v`, `podman volume rm`, or `podman machine rm`/`reset`. Vault shows the key only
+once, at init, so if `init.txt` is lost while `vault-data` still exists, Vault can never be
+unsealed again.
+
 ## Security model
 
 What this setup guarantees:
