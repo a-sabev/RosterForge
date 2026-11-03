@@ -6,7 +6,7 @@ Java backend depth for interview purposes — not a tutorial-follow project.
 ## Tech stack
 - Java 21, Spring Boot 4.1.1, Maven
 - Postgres (event store + read-model projections), real Kafka (event backbone)
-- Spring Cloud Vault for secrets (dev-mode Vault container, root token locally)
+- Spring Cloud Vault for secrets (server-mode Vault container, AppRole auth; see docker/README.md)
 - JUnit 5, Testcontainers (real Postgres/Kafka in tests, never mocked)
 - Flyway for migrations
 
@@ -46,5 +46,5 @@ single-purpose, closeable independently.
   that will bite me later (e.g., breaking replay determinism, weak legality validation).
 - Never silently "fix" domain logic — explain the issue and let me decide the fix.
 - Local dev only for now — Postgres on :5434, Kafka on :9094, Vault on :8200 (all via
-  docker/docker-compose.yaml, isolated ports to avoid clashing with other
+  docker/compose.yaml, isolated ports to avoid clashing with other
   local projects on this machine).

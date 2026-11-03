@@ -1,2 +1,6 @@
 /mvnw text eol=lf
 *.cmd text eol=crlf
+# Mounted into Linux containers: CRLF here breaks them on Windows checkouts.
+*.sh text eol=lf
+*.hcl text eol=lf
+Dockerfile text eol=lf

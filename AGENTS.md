@@ -6,7 +6,7 @@ Not a tutorial-follow project — built for depth and to demonstrate independent
 
 ## Setup
 - Java 21 required (Temurin recommended). Maven wrapper included — use `./mvnw` or `mvnw.cmd`.
-- Local infra runs via Docker/Podman Compose: `docker/docker-compose.yaml` defines
+- Local infra runs via Docker/Podman Compose: `docker/compose.yaml` defines
   Postgres (port 5434), Kafka (port 9094), Vault (port 8200) — all non-default ports to
   avoid clashing with other local services on this machine.
 
@@ -15,7 +15,7 @@ mvnw clean install
 
 ## Run
 1. Start infra first
-docker compose -f docker/docker-compose.yaml up -d # or: podman compose -f docker/docker-compose.yaml up -d
+docker compose -f docker/compose.yaml up -d # or: podman compose -f docker/compose.yaml up -d
 
 2. Then run the app (from IDE, or:)
 mvnw spring-boot:run
