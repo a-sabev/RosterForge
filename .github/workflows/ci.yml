@@ -184,6 +184,8 @@ jobs:
           exit-code: '0'
 
       - name: Render report
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           bash .github/scripts/trivy-report.sh trivy.json > report.md
           cat report.md >> "$GITHUB_STEP_SUMMARY"
