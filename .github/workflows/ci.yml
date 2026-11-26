@@ -14,9 +14,46 @@ concurrency:
 permissions:
   contents: read
 
+# Three jobs, each starting only after the previous one succeeds: build -> test -> scan.
+# Each job runs on a fresh runner. setup-java's Maven cache (saved by the build job) and the
+# wrapper cache carry ~/.m2 between them, so later jobs don't re-download dependencies.
+# mvnw is invoked via bash because it is not committed with the executable bit.
+
 jobs:
   build:
-    name: Build and test
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      # setup-java caches dependencies but not the Maven distribution mvnw downloads.
+      - name: Cache Maven wrapper
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/wrapper
+          key: maven-wrapper-${{ hashFiles('.mvn/wrapper/maven-wrapper.properties') }}
+
+      - name: Compile and package
+        run: bash ./mvnw -B -ntp package -DskipTests
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: rosterforge-jar
+          path: target/*.jar
+          retention-days: 7
+
+  test:
+    name: Test
+    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -29,18 +66,23 @@ jobs:
           java-version: '21'
           cache: maven
 
+      - name: Cache Maven wrapper
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/wrapper
+          key: maven-wrapper-${{ hashFiles('.mvn/wrapper/maven-wrapper.properties') }}
+
       # Docker is preinstalled on ubuntu-latest, so Testcontainers starts real
       # Postgres and Kafka here. Vault is disabled by the test config.
-      # mvnw is invoked via bash because it is not committed with the executable bit.
-      - name: Build and run tests
-        id: build
+      - name: Run tests
+        id: test
         run: bash ./mvnw -B -ntp verify
 
       # Renders a results table at the top of the run page from the surefire XML reports.
       - name: Write job summary
         if: always()
         env:
-          OUTCOME: ${{ steps.build.outcome }}
+          OUTCOME: ${{ steps.test.outcome }}
           BRANCH: ${{ github.head_ref || github.ref_name }}
           COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
@@ -60,9 +102,9 @@ jobs:
           done
 
           if [ "$OUTCOME" = "success" ]; then
-            echo "## ✅ Build passed"
+            echo "## ✅ Tests passed"
           else
-            echo "## ❌ Build failed"
+            echo "## ❌ Tests failed"
           fi >> "$GITHUB_STEP_SUMMARY"
 
           {
@@ -93,3 +135,73 @@ jobs:
           name: test-reports
           path: target/surefire-reports/
           retention-days: 7
+
+  scan:
+    name: Vulnerability scan
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write # to post the report as a PR comment
+    env:
+      TRIVY_VERSION: v0.76.2
+      COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Cache Maven wrapper
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/wrapper
+          key: maven-wrapper-${{ hashFiles('.mvn/wrapper/maven-wrapper.properties') }}
+
+      # Trivy resolves transitive dependencies from POMs. Reading them from a filled ~/.m2
+      # avoids fetching them from Maven Central, which rate-limits (429) shared runner IPs.
+      # Usually a no-op, since the cache restored above already has them.
+      - name: Resolve dependencies into ~/.m2
+        run: bash ./mvnw -B -ntp -q dependency:resolve
+
+      # Pinned to a commit SHA rather than a tag, so a moved tag can't change what runs here.
+      # Report-only for now (exit-code 0): findings are shown, they don't fail the build.
+      - name: Scan dependencies, Dockerfile and secrets
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          scan-type: fs
+          scan-ref: .
+          skip-dirs: target
+          scanners: vuln,secret,misconfig
+          format: json
+          output: trivy.json
+          exit-code: '0'
+
+      - name: Render report
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          bash .github/scripts/trivy-report.sh trivy.json > report.md
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+
+      # One comment per PR, edited in place on every push instead of piling up new ones.
+      - name: Post or update PR comment
+        if: github.event_name == 'pull_request' && !github.event.pull_request.head.repo.fork
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          marker='<!-- rosterforge-vulnerability-scan -->'
+          id=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
+                 --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | head -n1)
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -F body=@report.md > /dev/null
+          else
+            gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" -F body=@report.md > /dev/null
+          fi
