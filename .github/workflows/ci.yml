@@ -93,3 +93,51 @@ jobs:
           name: test-reports
           path: target/surefire-reports/
           retention-days: 7
+
+  vulnerability-scan:
+    name: Vulnerability scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write # to post the report as a PR comment
+    env:
+      TRIVY_VERSION: v0.76.2
+      COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned to a commit SHA rather than a tag, so a moved tag can't change what runs here.
+      # Report-only for now (exit-code 0): findings are shown, they don't fail the build.
+      - name: Scan dependencies, Dockerfile and secrets
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          format: json
+          output: trivy.json
+          exit-code: '0'
+
+      - name: Render report
+        run: |
+          bash .github/scripts/trivy-report.sh trivy.json > report.md
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+
+      # One comment per PR, edited in place on every push instead of piling up new ones.
+      - name: Post or update PR comment
+        if: github.event_name == 'pull_request' && !github.event.pull_request.head.repo.fork
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          marker='<!-- rosterforge-vulnerability-scan -->'
+          id=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
+                 --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | head -n1)
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -F body=@report.md > /dev/null
+          else
+            gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" -F body=@report.md > /dev/null
+          fi
