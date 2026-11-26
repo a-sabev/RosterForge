@@ -21,9 +21,9 @@ packages=$(jq '[.Results[]?.Vulnerabilities[]?.PkgName] | unique | length' "$rep
 
 plural() { (( $1 == 1 )) && echo "$1 $2" || echo "$1 ${3:-$2s}"; }
 
-# shields.io badge: grey when zero, the severity colour otherwise.
+# shields.io badge: green when zero, the severity colour otherwise.
 badge() { # label count colour
-  local colour=$3; (( $2 == 0 )) && colour=lightgrey
+  local colour=$3; (( $2 == 0 )) && colour=brightgreen
   echo "![$1: $2](https://img.shields.io/badge/${1// /%20}-$2-$colour?style=for-the-badge)"
 }
 
