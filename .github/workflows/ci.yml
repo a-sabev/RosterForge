@@ -33,7 +33,58 @@ jobs:
       # Postgres and Kafka here. Vault is disabled by the test config.
       # mvnw is invoked via bash because it is not committed with the executable bit.
       - name: Build and run tests
+        id: build
         run: bash ./mvnw -B -ntp verify
+
+      # Renders a results table at the top of the run page from the surefire XML reports.
+      - name: Write job summary
+        if: always()
+        env:
+          OUTCOME: ${{ steps.build.outcome }}
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+          COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          shopt -s nullglob
+          attr() { sed -n "s/.* $1=\"\([^\"]*\)\".*/\1/p" <<<"$2"; }
+
+          total=0; failed=0; skipped=0; seconds=0; rows=""
+          for f in target/surefire-reports/TEST-*.xml; do
+            suite=$(grep -m1 -o '<testsuite [^>]*>' "$f")
+            name=$(attr name "$suite"); tests=$(attr tests "$suite")
+            bad=$(( $(attr failures "$suite") + $(attr errors "$suite") ))
+            skip=$(attr skipped "$suite"); time=$(attr time "$suite" | tr -d ,)
+            total=$((total + tests)); failed=$((failed + bad)); skipped=$((skipped + skip))
+            seconds=$(awk -v a="$seconds" -v b="$time" 'BEGIN { print a + b }')
+            icon="✅"; [ "$bad" -gt 0 ] && icon="❌"
+            rows+="| $icon | \`${name##*.}\` | $((tests - bad - skip)) / $tests | $skip | ${time}s |"$'\n'
+          done
+
+          if [ "$OUTCOME" = "success" ]; then
+            echo "## ✅ Build passed"
+          else
+            echo "## ❌ Build failed"
+          fi >> "$GITHUB_STEP_SUMMARY"
+
+          {
+            echo
+            echo "\`${COMMIT::7}\` on \`$BRANCH\` · Java 21 · Testcontainers (Postgres, Kafka)"
+            echo
+            if [ "$total" -eq 0 ]; then
+              echo "> No test reports found. The build failed before tests ran; see the step log."
+            else
+              echo "| | Tests | Passed | Failed | Skipped | Time |"
+              echo "|---|---:|---:|---:|---:|---:|"
+              echo "| **Total** | **$total** | **$((total - failed - skipped))** | **$failed** | **$skipped** | **${seconds}s** |"
+              echo
+              echo "<details><summary>Per test class</summary>"
+              echo
+              echo "| | Class | Passed | Skipped | Time |"
+              echo "|---|---|---:|---:|---:|"
+              printf '%s' "$rows"
+              echo
+              echo "</details>"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload test reports
         if: failure()
